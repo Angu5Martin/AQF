@@ -1,0 +1,21 @@
+NASDAQ_TICKERS = [
+    'AAPL',   
+    'MSFT',   
+    'GOOGL',  
+    'AMZN',   
+    'TSLA',  
+    'NVDA',   
+    'META',   
+    'NFLX',   
+    'ADBE',  
+    'PYPL',   
+    'INTC',   
+    'CSCO',   
+    'CMCSA',  
+    'PEP',    
+    'AVGO',   
+    'TXN',    
+    'QCOM',   
+    'COST',   
+    'AMGN'    
+]
