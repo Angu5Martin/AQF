@@ -18,6 +18,7 @@ import boto3
 import pandas as pd
 import s3fs
 import pytz
+import numpy as np
 from typing import List, Optional, Dict, Union, Tuple
 from datetime import datetime, date, timedelta
 import warnings
@@ -281,64 +282,249 @@ class FirstRateDataClient:
                 print(f"❌ No data found for {ticker} on {trading_date}")
         return None
     
-    def get_summary_stats(self, df: pd.DataFrame) -> Dict:
-        """Generate summary statistics for a dataset."""
-        if df is None or len(df) == 0:
-            return {}
-        
-        stats = {
-            'total_records': len(df),
-            'unique_tickers': df['ticker'].nunique(),
-            'date_range': {
-                'start': df['timestamp'].min(),
-                'end': df['timestamp'].max(),
-                'trading_hours': f"{df['timestamp'].dt.time.min()} - {df['timestamp'].dt.time.max()}"
-            },
-            'volume_stats': {
-                'total_volume': df['volume'].sum(),
-                'avg_volume': df['volume'].mean(),
-                'median_volume': df['volume'].median()
-            },
-            'price_stats': {
-                'avg_price': df['close'].mean(),
-                'price_range': f"${df['close'].min():.2f} - ${df['close'].max():.2f}",
-                'most_expensive': df.loc[df['close'].idxmax(), 'ticker'],
-                'least_expensive': df.loc[df['close'].idxmin(), 'ticker']
-            },
-            'top_tickers_by_volume': df.groupby('ticker')['volume'].sum().sort_values(ascending=False).head(10)
-        }
-        
-        return stats
+    # ---------------------------
+    # Important for NN training
+    # ---------------------------
     
-    def print_summary(self, df: pd.DataFrame):
-        """Print a formatted summary of the dataset."""
-        if df is None or len(df) == 0:
-            print("❌ No data to summarize")
-            return
+    def load_multi_ticker_data(self, tickers: List[str], 
+                               start_date: Optional[Union[str, date, datetime]] = None,
+                               end_date: Optional[Union[str, date, datetime]] = None,
+                               days_back: Optional[int] = None, 
+                               frequency: str = '5T',
+                               add_features: bool = True,
+                               fill_method: str = 'forward') -> pd.DataFrame:
+        """
+        Load data for multiple tickers over a date range with custom sampling frequency.
+        Designed for neural network input preparation.
         
-        stats = self.get_summary_stats(df)
+        Args:
+            tickers: List of stock ticker symbols
+            start_date: Start date (if provided, overrides days_back)
+            end_date: End date (if None, uses most recent available data)
+            days_back: Number of trading days to go back from end_date (ignored if start_date provided)
+            frequency: Pandas frequency string ('1T', '5T', '15T', '1H', etc.) - T for minutes
+            add_features: Whether to add engineered features (returns, moving averages, etc.)
+            fill_method: How to handle missing data ('forward', 'backward', 'drop', 'zero')
+            
+        Returns:
+            Combined DataFrame with all tickers and timestamps
+        """
+        try:
+            # print(f"🔄 Loading multi-ticker data for neural network preparation...")
+            # print(f"   Tickers: {tickers}")
+            # print(f"   Frequency: {frequency}")
+            # print(f"   Add features: {add_features}")
+            # print(f"   Fill method: {fill_method}")
+            
+            # Determine date range
+            if start_date is not None and end_date is not None:
+                start_date = self._parse_date(start_date)
+                end_date = self._parse_date(end_date)
+                print(f"   Date range: {start_date} to {end_date}")
+            elif days_back is not None:
+                # Find the most recent available date and go back
+                if end_date is None:
+                    dates_info = self.get_available_dates()
+                    if not dates_info.get('years'):
+                        print("❌ No data available")
+                        return pd.DataFrame()
+                    
+                    latest_year = dates_info['latest_year']
+                    latest_months = dates_info['latest_year_months']
+                    
+                    if not latest_months:
+                        print("❌ No months available for latest year")
+                        return pd.DataFrame()
+                    
+                    end_date = date(latest_year, max(latest_months), 28)
+                else:
+                    end_date = self._parse_date(end_date)
+                
+                # Calculate start date (going back by days_back trading days)
+                calendar_days_back = int(days_back * 1.4)  # Account for weekends
+                start_date = end_date - timedelta(days=calendar_days_back)
+                
+                print(f"   Date range: {start_date} to {end_date} ({days_back} trading days back)")
+            else:
+                print("❌ Must provide either (start_date, end_date) or days_back parameter")
+                return pd.DataFrame()
+            
+            # Load raw data for the date range
+            max_days = (end_date - start_date).days + 5
+            raw_data = self.load_date_range(start_date, end_date, max_days=max_days)
+            
+            if raw_data is None or raw_data.empty:
+                print("❌ No data loaded for date range")
+                return pd.DataFrame()
+            
+            # Filter for requested tickers
+            available_tickers = set(raw_data['ticker'].unique())
+            missing_tickers = set(tickers) - available_tickers
+            found_tickers = list(set(tickers) & available_tickers)
+            
+            if missing_tickers:
+                print(f"⚠️  Missing tickers: {list(missing_tickers)}")
+            if found_tickers:
+                print(f"✅ Found tickers: {found_tickers}")
+            
+            if not found_tickers:
+                print("❌ None of the requested tickers found")
+                return pd.DataFrame()
+            
+            # Filter for found tickers only
+            filtered_data = raw_data[raw_data['ticker'].isin(found_tickers)].copy()
+            
+            # Process each ticker and combine results
+            all_ticker_data = []
+            
+            for ticker in found_tickers:
+                print(f"   Processing {ticker}...")
+                
+                # Filter data for this ticker
+                ticker_df = filtered_data[filtered_data['ticker'] == ticker].copy()
+                ticker_df = ticker_df.sort_values('timestamp').set_index('timestamp')
+                
+                # Resample to requested frequency
+                resampled_df = ticker_df.resample(frequency).agg({
+                    'open': 'first',
+                    'high': 'max', 
+                    'low': 'min',
+                    'close': 'last',
+                    'volume': 'sum'
+                })
+                
+                # Handle missing data based on fill_method
+                if fill_method == 'forward':
+                    resampled_df = resampled_df.fillna(method='ffill')
+                elif fill_method == 'backward':
+                    resampled_df = resampled_df.fillna(method='bfill')
+                elif fill_method == 'zero':
+                    resampled_df = resampled_df.fillna(0)
+                elif fill_method == 'drop':
+                    resampled_df = resampled_df.dropna()
+                
+                # Add ticker column
+                resampled_df['ticker'] = ticker
+                
+                # Add useful features for neural networks if requested
+                if add_features:
+                    resampled_df['returns'] = resampled_df['close'].pct_change()
+                    resampled_df['log_returns'] = np.log(resampled_df['close'] / resampled_df['close'].shift(1))
+                    resampled_df['high_low_pct'] = (resampled_df['high'] - resampled_df['low']) / resampled_df['close']
+                    resampled_df['volume_ma'] = resampled_df['volume'].rolling(window=20, min_periods=1).mean()
+                    resampled_df['price_ma'] = resampled_df['close'].rolling(window=20, min_periods=1).mean()
+                
+                # Reset index to make timestamp a column
+                resampled_df = resampled_df.reset_index()
+                
+                all_ticker_data.append(resampled_df)
+                print(f"      ✅ {ticker}: {len(resampled_df)} samples")
+            
+            # Combine all ticker data
+            if all_ticker_data:
+                combined_df = pd.concat(all_ticker_data, ignore_index=True)
+                combined_df = combined_df.sort_values(['timestamp', 'ticker']).reset_index(drop=True)
+                
+                # Print summary
+                total_samples = len(combined_df)
+                unique_timestamps = combined_df['timestamp'].nunique()
+                date_range = f"{combined_df['timestamp'].min().date()} to {combined_df['timestamp'].max().date()}"
+                
+                # print(f"\n Multi-ticker dataset summary:")
+                # print(f"   Tickers loaded: {len(found_tickers)}")
+                # print(f"   Total samples: {total_samples:,}")
+                # print(f"   Unique timestamps: {unique_timestamps:,}")
+                # print(f"   Date range: {date_range}")
+                # print(f"   Frequency: {frequency}")
+                # print(f"   Features per record: {len(combined_df.columns)}")
+                
+                # # Show feature columns
+                # print(f"   Available columns: {list(combined_df.columns)}")
+                
+                return combined_df
+            else:
+                print("❌ No data processed")
+                return pd.DataFrame()
+            
+        except Exception as e:
+            print(f"❌ Error loading multi-ticker data: {e}")
+            import traceback
+            traceback.print_exc()
+            return pd.DataFrame()
+    
+    def create_aligned_dataset(self, multi_ticker_data: pd.DataFrame, 
+                              value_column: str = 'close',
+                              fill_method: str = 'forward') -> Optional[pd.DataFrame]:
+        """
+        Create a time-aligned dataset with all tickers as columns.
+        Perfect for neural networks that need synchronized data.
         
-        print("📊 DATASET SUMMARY")
-        print("=" * 50)
-        print(f"Records: {stats['total_records']:,}")
-        print(f"Unique tickers: {stats['unique_tickers']:,}")
-        print(f"Date range: {stats['date_range']['start']} to {stats['date_range']['end']}")
-        print(f"Trading hours: {stats['date_range']['trading_hours']}")
-        print()
-        print(f"Total volume: {stats['volume_stats']['total_volume']:,.0f}")
-        print(f"Average volume per record: {stats['volume_stats']['avg_volume']:.2f}")
-        print()
-        print(f"Average price: ${stats['price_stats']['avg_price']:.2f}")
-        print(f"Price range: {stats['price_stats']['price_range']}")
-        print(f"Most expensive: {stats['price_stats']['most_expensive']}")
-        print(f"Least expensive: {stats['price_stats']['least_expensive']}")
-        print()
-        print("Top 10 tickers by total volume:")
-        for ticker, volume in stats['top_tickers_by_volume'].items():
-            print(f"  {ticker}: {volume:,.0f}")
+        Args:
+            multi_ticker_data: DataFrame from load_multi_ticker_data()
+            value_column: Column to use as the main value (e.g., 'close', 'returns', 'log_returns')
+            fill_method: How to handle missing data ('forward', 'backward', 'drop', 'zero')
+            
+        Returns:
+            DataFrame with timestamp index and tickers as columns
+        """
+        try:
+            if multi_ticker_data.empty:
+                print("❌ Empty multi-ticker data provided")
+                return None
+            
+            print(f"Creating aligned dataset from {value_column} column...")
+            
+            # Check if the required column exists
+            if value_column not in multi_ticker_data.columns:
+                print(f"❌ Column '{value_column}' not found in data")
+                print(f"Available columns: {list(multi_ticker_data.columns)}")
+                return None
+            
+            # Pivot the data to have tickers as columns
+            aligned_df = multi_ticker_data.pivot(
+                index='timestamp', 
+                columns='ticker', 
+                values=value_column
+            )
+            
+            # Handle missing data based on fill_method
+            if fill_method == 'forward':
+                aligned_df = aligned_df.fillna(method='ffill')
+            elif fill_method == 'backward':
+                aligned_df = aligned_df.fillna(method='bfill')
+            elif fill_method == 'zero':
+                aligned_df = aligned_df.fillna(0)
+            elif fill_method == 'drop':
+                aligned_df = aligned_df.dropna()
+            
+            print(f"✅ Aligned dataset created:")
+            # print(f"   Shape: {aligned_df.shape}")
+            # print(f"   Time range: {aligned_df.index.min()} to {aligned_df.index.max()}")
+            # print(f"   Tickers (columns): {list(aligned_df.columns)}")
+            
+            # Check for missing values
+            missing_counts = aligned_df.isnull().sum()
+            if missing_counts.sum() > 0:
+                print(f"   Missing values per ticker:")
+                for ticker, count in missing_counts.items():
+                    if count > 0:
+                        pct = count / len(aligned_df) * 100
+                        print(f"      {ticker}: {count} ({pct:.1f}%)")
+            else:
+                print(f"   No missing values")
+            
+            return aligned_df
+            
+        except Exception as e:
+            print(f"❌ Error creating aligned dataset: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
-
+# ---------------------------------------
 # Convenience functions for quick access
+# ---------------------------------------
+
 def quick_load_day(trading_date: str) -> Optional[pd.DataFrame]:
     """Quick function to load a single day's data."""
     client = FirstRateDataClient()
