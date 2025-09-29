@@ -135,6 +135,7 @@ class DilatedCausalCNN(pl.LightningModule):
         # return last time step prediction only
         return out[:, :, -1]
 
+
     def training_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
@@ -158,14 +159,16 @@ class DilatedCausalCNN(pl.LightningModule):
         return torch.optim.Adam(self.parameters(), lr=self.lr)
 
 class StockVolDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, num_days: int = 1):
+    def __init__(self, df: pd.DataFrame, num_days: int = 1, mode="univariate"):
         """
         Args:
             df: pandas DataFrame with DateTimeIndex (intraday frequency), columns=tickers, values=prices
             num_days: length of observation window in days
         """
         assert isinstance(df.index, pd.DatetimeIndex)
+        assert mode in ["multivariate", "univariate"], "mode must be 'multivariate' or 'univariate'"
         self.num_days = num_days
+        self.mode = mode
 
         # compute log-returns
         self.logret = np.log(df / df.shift(1))
@@ -185,7 +188,11 @@ class StockVolDataset(Dataset):
             intraday_next = self.logret.loc[next_day:next_day + pd.Timedelta(days=0.5)]
             y = np.sqrt((intraday_next ** 2).sum(axis=0))
 
-            self.samples.append((X.values, y.values))
+            if self.mode == "multivariate":
+                self.samples.append((X.values, y.values))
+            elif self.mode == "univariate":
+                for c in range(X.shape[1]):
+                    self.samples.append((X.values[:, c:c+1], y.values[c:c+1]))
 
     def __len__(self):
         return len(self.samples)
@@ -199,16 +206,17 @@ class StockVolDataset(Dataset):
 
 
 class StockVolDataModule(pl.LightningDataModule):
-    def __init__(self, df: pd.DataFrame, num_days: int = 1, batch_size: int = 32, val_ratio: float = 0.1, test_ratio: float = 0.1):
+    def __init__(self, df: pd.DataFrame, num_days: int = 1, mode = "multivariate", batch_size: int = 32, val_ratio: float = 0.1, test_ratio: float = 0.1):
         super().__init__()
         self.df = df
         self.num_days = num_days
+        self.mode = mode
         self.batch_size = batch_size
         self.val_ratio = val_ratio
         self.test_ratio = test_ratio
 
     def setup(self, stage=None):
-        dataset = StockVolDataset(self.df, num_days=self.num_days)
+        dataset = StockVolDataset(self.df, num_days=self.num_days, mode=self.mode)
         n_total = len(dataset)
         n_test = int(n_total * self.test_ratio)
         n_val = int(n_total * self.val_ratio)
