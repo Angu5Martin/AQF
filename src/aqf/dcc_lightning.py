@@ -49,13 +49,13 @@ class CausalConv1d(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, residual_channels, skip_channels, kernel_size, dilation, dropout=0.0):
+    def __init__(self, residual_channels, dilation_channels, skip_channels, kernel_size, dilation, dropout=0.0):
         super().__init__()
-        self.filter_conv = CausalConv1d(residual_channels, residual_channels, kernel_size, dilation)
-        self.gate_conv = CausalConv1d(residual_channels, residual_channels, kernel_size, dilation)
+        self.filter_conv = CausalConv1d(residual_channels, dilation_channels, kernel_size, dilation)
+        self.gate_conv = CausalConv1d(residual_channels, dilation_channels, kernel_size, dilation)
 
-        self.residual_conv = nn.Conv1d(residual_channels, residual_channels, kernel_size=1)
-        self.skip_conv = nn.Conv1d(residual_channels, skip_channels, kernel_size=1)
+        self.residual_conv = nn.Conv1d(dilation_channels, residual_channels, kernel_size=1)
+        self.skip_conv = nn.Conv1d(dilation_channels, skip_channels, kernel_size=1)
 
         self.dropout = nn.Dropout(dropout)
 
@@ -74,6 +74,26 @@ class ResidualBlock(nn.Module):
 
         return x, skip
 
+class LayerwiseAttention(nn.Module):
+    def __init__(self, skip_channels, hidden_size):
+        super().__init__()
+        # Bahdanau-style additive attention
+        self.W = nn.Linear(skip_channels, hidden_size)
+        self.v = nn.Linear(hidden_size, 1, bias=False)
+
+
+    def forward(self, layer_skips):
+    # layer_skips: list of tensors (B, C, T)
+        pooled = [s.mean(dim=2) for s in layer_skips] # (B, C)
+        H = torch.stack(pooled, dim=1) # (B, L, C)
+
+
+        scores = self.v(torch.tanh(self.W(H))) # (B, L, 1)
+        attn_weights = torch.softmax(scores, dim=1) # (B, L, 1)
+
+
+        context = (H * attn_weights).sum(dim=1) # (B, C)
+        return context, attn_weights.squeeze(-1)
 
 class DilatedCausalCNN(pl.LightningModule):
     def __init__(
@@ -81,8 +101,9 @@ class DilatedCausalCNN(pl.LightningModule):
         in_channels,
         out_channels,
         residual_channels=64,
+        dilation_channels=64,
         skip_channels=128,
-        end_channels=64,
+        end_channels=64,  # hidden size for attention scoring
         kernel_size=3,
         num_blocks=2,
         num_layers=6,
@@ -101,6 +122,7 @@ class DilatedCausalCNN(pl.LightningModule):
                 self.blocks.append(
                     ResidualBlock(
                         residual_channels=residual_channels,
+                        dilation_channels=dilation_channels,
                         skip_channels=skip_channels,
                         kernel_size=kernel_size,
                         dilation=dilation,
@@ -108,33 +130,27 @@ class DilatedCausalCNN(pl.LightningModule):
                     )
                 )
 
-        self.output_proj = nn.Sequential(
-            nn.ReLU(),
-            nn.Conv1d(skip_channels, end_channels, kernel_size=1),
-            nn.ReLU(),
-            nn.Conv1d(end_channels, out_channels, kernel_size=1),
-        )
+        # Layer-wise attention over skip connections
+        self.attention = LayerwiseAttention(skip_channels, end_channels)
+
+        # Final projection
+        self.fc_out = nn.Linear(skip_channels, out_channels)
 
         self.lr = lr
 
     def forward(self, x):
-        # x: (B, T, C) → permute to (B, C, T)
+        # x: (B, T, C) → (B, C, T)
         x = x.permute(0, 2, 1)
         x = self.input_proj(x)
 
-        skip_connections = []
+        skip_outputs = []
         for block in self.blocks:
             x, skip = block(x)
-            skip_connections.append(skip)
+            skip_outputs.append(F.relu(skip))
 
-        # sum skip connections (align time dim)
-        total_skip = sum([s[:, :, -x.size(2):] for s in skip_connections])
-
-        out = self.output_proj(total_skip)
-
-        # return last time step prediction only
-        return out[:, :, -1]
-
+        context, attn_weights = self.attention(skip_outputs)
+        out = self.fc_out(context)
+        return out
 
     def training_step(self, batch, batch_idx):
         x, y = batch
