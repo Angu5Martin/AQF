@@ -48,65 +48,94 @@ class CausalConv1d(nn.Module):
         return self.conv(x)
 
 
-class ResidualBlock(nn.Module):
-    def __init__(self, residual_channels, dilation_channels, skip_channels, kernel_size, dilation, dropout=0.0):
-        super().__init__()
-        self.filter_conv = CausalConv1d(residual_channels, dilation_channels, kernel_size, dilation)
-        self.gate_conv = CausalConv1d(residual_channels, dilation_channels, kernel_size, dilation)
+class TimeAttention(nn.Module):
+    """Additive (Bahdanau-style) attention over the time dimension for one layer.
 
+    Input: tensor of shape (B, C, T)
+    - applies a small MLP on the channel dimension at each time step and
+      produces attention scores over T, then weighted-sums to (B, C).
+    Output: (context (B, C), attn_weights (B, T))
+    """
+
+    def __init__(self, channels, hidden_size):
+        super().__init__()
+        self.W = nn.Linear(channels, hidden_size)
+        self.v = nn.Linear(hidden_size, 1, bias=False)
+
+    def forward(self, x):
+        # x: (B, C, T) -> work on (B, T, C)
+        # b, c, t = x.shape
+        H = x.permute(0, 2, 1)  # (B, T, C)
+        # score each time step
+        scores = self.v(torch.tanh(self.W(H)))  # (B, T, 1)
+        scores = scores.squeeze(-1)  # (B, T)
+        attn = torch.softmax(scores, dim=1)  # (B, T)
+        attn_exp = attn.unsqueeze(-1)  # (B, T, 1)
+        context = (H * attn_exp).sum(dim=1)  # (B, C)
+        return context, attn
+
+
+class ResidualBlock(nn.Module):
+    """Residual block without gated filter/gate. Uses a single dilated causal conv
+    that expands to `dilation_channels`, then produces a residual (1x1 -> residual_channels)
+    and a skip (1x1 -> skip_channels). Additionally, we apply a TimeAttention
+    module per block on the skip features across time to get a per-layer context.
+    """
+
+    def __init__(self, residual_channels, dilation_channels, skip_channels, kernel_size, dilation, hidden_attn=32, dropout=0.0):
+        super().__init__()
+        # single dilated conv (no gating)
+        self.dilated_conv = CausalConv1d(residual_channels, dilation_channels, kernel_size, dilation)
+        self.activation = nn.ReLU()
+
+        # projections
         self.residual_conv = nn.Conv1d(dilation_channels, residual_channels, kernel_size=1)
         self.skip_conv = nn.Conv1d(dilation_channels, skip_channels, kernel_size=1)
+
+        # attention over time for this layer, applied to skip features
+        self.time_attn = TimeAttention(skip_channels, hidden_attn)
 
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         # x: (B, residual_channels, T)
-        filter_out = torch.tanh(self.filter_conv(x))
-        gate_out = torch.sigmoid(self.gate_conv(x))
-        z = filter_out * gate_out
+        z = self.dilated_conv(x)  # (B, dilation_channels, T)
+        z = self.activation(z)
         z = self.dropout(z)
 
-        residual = self.residual_conv(z)
-        skip = self.skip_conv(z)
+        # residual path (per-time)
+        residual = self.residual_conv(z)  # (B, residual_channels, T)
 
-        # residual connection (same shape)
+        # skip features (per-time)
+        skip_time = self.skip_conv(z)  # (B, skip_channels, T)
+        # Apply ReLU nonlinearity to skip features (sigma_ReLU)
+        skip_time_relu = F.relu(skip_time)
+        # Time-wise attention -> per-layer context
+        context, attn_weights = self.time_attn(skip_time_relu)  # context: (B, skip_channels)
+
         x = x + residual
-
-        return x, skip
-
-class LayerwiseAttention(nn.Module):
-    def __init__(self, skip_channels, hidden_size):
-        super().__init__()
-        # Bahdanau-style additive attention
-        self.W = nn.Linear(skip_channels, hidden_size)
-        self.v = nn.Linear(hidden_size, 1, bias=False)
-
-
-    def forward(self, layer_skips):
-    # layer_skips: list of tensors (B, C, T)
-        pooled = [s.mean(dim=2) for s in layer_skips] # (B, C)
-        H = torch.stack(pooled, dim=1) # (B, L, C)
-
-
-        scores = self.v(torch.tanh(self.W(H))) # (B, L, 1)
-        attn_weights = torch.softmax(scores, dim=1) # (B, L, 1)
-
-
-        context = (H * attn_weights).sum(dim=1) # (B, C)
-        return context, attn_weights.squeeze(-1)
+        return x, skip_time_relu, context, attn_weights
+    
 
 class DilatedCausalCNN(pl.LightningModule):
+    """Dilated causal CNN with per-layer temporal attention implementing
+    the form: sigma^2_{T+1} = alpha0 + sum_l sigma_ReLU(F^{(l)}),
+    where each F^{(l)} is first time-attended (within layer) and then
+    summed across layers. The per-layer 1x1 skip projections provide
+    learnable scaling before summation.
+    """
     def __init__(
         self,
         in_channels,
         out_channels,
         residual_channels=64,
-        dilation_channels=64,
+        dilation_channels=128,
         skip_channels=128,
-        end_channels=64,  # hidden size for attention scoring
+        end_channels=64,
         kernel_size=3,
         num_blocks=2,
         num_layers=6,
+        hidden_attn=32,
         dropout=0.0,
         lr=1e-3,
     ):
@@ -126,16 +155,20 @@ class DilatedCausalCNN(pl.LightningModule):
                         skip_channels=skip_channels,
                         kernel_size=kernel_size,
                         dilation=dilation,
+                        hidden_attn=hidden_attn,
                         dropout=dropout,
                     )
                 )
 
-        # Layer-wise attention over skip connections
-        self.attention = LayerwiseAttention(skip_channels, end_channels)
+        # final projection from aggregated layer contexts to output
+        self.fc_out = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(skip_channels, end_channels),
+            nn.ReLU(),
+            nn.Linear(end_channels, out_channels),
+        )
 
-        # Final projection
-        self.fc_out = nn.Linear(skip_channels, out_channels)
-
+        self.alpha0 = nn.Parameter(torch.zeros(out_channels))
         self.lr = lr
 
     @staticmethod
@@ -146,17 +179,26 @@ class DilatedCausalCNN(pl.LightningModule):
         return loss.mean()
     
     def forward(self, x):
-        # x: (B, T, C) → (B, C, T)
+        # x: (B, T, C) -> (B, C, T)
         x = x.permute(0, 2, 1)
         x = self.input_proj(x)
 
-        skip_outputs = []
-        for block in self.blocks:
-            x, skip = block(x)
-            skip_outputs.append(F.relu(skip))
+        layer_contexts = []  # list of (B, skip_channels)
+        layer_attns = []
 
-        context, attn_weights = self.attention(skip_outputs)
-        out = self.fc_out(context)
+        for block in self.blocks:
+            x, skip_time_relu, context, attn_weights = block(x)
+            layer_contexts.append(context)
+            layer_attns.append(attn_weights)
+
+        # aggregate contexts across layers by simple summation -> (B, C)
+        agg = torch.stack(layer_contexts, dim=0).sum(dim=0)
+
+        # final mapping to outputs
+        out = self.fc_out(agg)  # (B, out_channels)
+
+        # add learnable bias alpha0 (broadcasted)
+        out = out + self.alpha0
         return out
 
     def training_step(self, batch, batch_idx):
