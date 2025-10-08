@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 
 import pytorch_lightning as pl
 
@@ -138,6 +138,13 @@ class DilatedCausalCNN(pl.LightningModule):
 
         self.lr = lr
 
+    @staticmethod
+    def qlike_loss(y_true, y_pred, eps=1e-12):
+        y_hat = torch.clamp(y_pred, min=eps)
+        ratio = y_true / y_hat
+        loss = ratio - torch.log(ratio) - 1
+        return loss.mean()
+    
     def forward(self, x):
         # x: (B, T, C) → (B, C, T)
         x = x.permute(0, 2, 1)
@@ -155,6 +162,7 @@ class DilatedCausalCNN(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
+        # loss = self.qlike_loss(y, y_hat)
         loss = F.mse_loss(y_hat, y)
         self.log("train_loss", loss)
         return loss
@@ -162,12 +170,14 @@ class DilatedCausalCNN(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
+        # loss = self.qlike_loss(y, y_hat)
         loss = F.mse_loss(y_hat, y)
         self.log("val_loss", loss)
 
     def test_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
+        # loss = self.qlike_loss(y, y_hat)
         loss = F.mse_loss(y_hat, y)
         self.log("test_loss", loss)
 
@@ -175,7 +185,7 @@ class DilatedCausalCNN(pl.LightningModule):
         return torch.optim.Adam(self.parameters(), lr=self.lr)
 
 class StockVolDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, num_days: int = 1, mode="univariate"):
+    def __init__(self, df: pd.DataFrame, num_days: int = 1, mode="univariate", return_timestamps=False, return_tickers=False):
         """
         Args:
             df: pandas DataFrame with DateTimeIndex (intraday frequency), columns=tickers, values=prices
@@ -192,23 +202,30 @@ class StockVolDataset(Dataset):
         # group by unique calendar days
         self.days = sorted(set(self.logret.index.normalize()))
         self.samples = []
+        self.timestamps = [] if return_timestamps else None
+        self.tickers = [] if return_tickers else None
 
-        for i in range(num_days, len(self.days) - 1):
+        for i in range(num_days, len(self.days)):
             # input window: last num_days of log-returns
             start_day = self.days[i - num_days]
             end_day = self.days[i]
             X = self.logret.loc[start_day:end_day].iloc[1:]  # drop first NaN row
 
             # realized vol = sqrt(sum intraday logret^2)) for next day
-            next_day = self.days[i + 1]
-            intraday_next = self.logret.loc[next_day:next_day + pd.Timedelta(days=0.5)]
+            intraday_next = self.logret.loc[end_day:end_day + pd.Timedelta(days=0.5)]
             y = np.sqrt((intraday_next ** 2).sum(axis=0))
 
             if self.mode == "multivariate":
                 self.samples.append((X.values, y.values))
+                if return_timestamps: 
+                    self.timestamps.append(start_day)
             elif self.mode == "univariate":
                 for c in range(X.shape[1]):
                     self.samples.append((X.values[:, c:c+1], y.values[c:c+1]))
+                    if return_timestamps: 
+                        self.timestamps.append(start_day)
+                    if return_tickers:
+                        self.tickers.append(c)
 
     def __len__(self):
         return len(self.samples)
@@ -222,35 +239,59 @@ class StockVolDataset(Dataset):
 
 
 class StockVolDataModule(pl.LightningDataModule):
-    def __init__(self, df: pd.DataFrame, num_days: int = 1, mode = "multivariate", batch_size: int = 32, val_ratio: float = 0.1, test_ratio: float = 0.1):
+    def __init__(self, df: pd.DataFrame, val_start_date, test_start_date, num_days: int = 1, mode = "multivariate", ticker_split = False, batch_size: int = 32):
         super().__init__()
         self.df = df
+        self.val_start_date = val_start_date
+        self.test_start_date = test_start_date
         self.num_days = num_days
         self.mode = mode
+        self.ticker_split = ticker_split
         self.batch_size = batch_size
-        self.val_ratio = val_ratio
-        self.test_ratio = test_ratio
 
     def setup(self, stage=None):
-        dataset = StockVolDataset(self.df, num_days=self.num_days, mode=self.mode)
-        n_total = len(dataset)
-        n_test = int(n_total * self.test_ratio)
-        n_val = int(n_total * self.val_ratio)
-        n_train = n_total - n_val - n_test
+        self.full_dataset = StockVolDataset(self.df, num_days=self.num_days, mode=self.mode, return_timestamps=True, return_tickers=(self.mode == "univariate"))
+        timestamps = pd.to_datetime(self.full_dataset.timestamps)
 
-        self.train_set, self.val_set, self.test_set = torch.utils.data.random_split(
-            dataset, [n_train, n_val, n_test],
-            generator=torch.Generator().manual_seed(256)
-        )
+        train_mask = timestamps < self.val_start_date
+        val_mask = (timestamps >= self.val_start_date) & (timestamps < self.test_start_date)
+        test_mask = timestamps >= self.test_start_date
+
+        if self.mode == "univariate" and self.ticker_split:
+            tickers = np.array(self.full_dataset.tickers)
+            unique_tickers = np.unique(tickers)
+            rng = np.random.default_rng(256)
+            rng.shuffle(unique_tickers)
+            mid = len(unique_tickers) // 2
+            train_tickers = unique_tickers[:mid]
+            test_tickers = unique_tickers[mid:]
+
+            train_ticker_mask = np.isin(tickers, train_tickers)
+            test_ticker_mask = np.isin(tickers, test_tickers)
+
+            train_mask = train_mask & train_ticker_mask
+            val_mask = val_mask & train_ticker_mask
+            test_mask = test_mask & test_ticker_mask
+
+        train_idx = np.where(train_mask)[0]
+        val_idx = np.where(val_mask)[0]
+        test_idx = np.where(test_mask)[0]
+
+        self.train_dataset = Subset(self.full_dataset, train_idx)
+        self.val_dataset = Subset(self.full_dataset, val_idx)
+        self.test_dataset = Subset(self.full_dataset, test_idx)
+
+        print(f"Dataset split: train={len(self.train_dataset)}, val={len(self.val_dataset)}, test={len(self.test_dataset)}")
+
 
     def train_dataloader(self):
-        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True)
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
 
     def val_dataloader(self):
-        return DataLoader(self.val_set, batch_size=self.batch_size)
+        return DataLoader(self.val_dataset, batch_size=self.batch_size)
 
     def test_dataloader(self):
-        return DataLoader(self.test_set, batch_size=self.batch_size)
+        return DataLoader(self.test_dataset, batch_size=self.batch_size)
 
 
 class LossHistory(pl.Callback):
