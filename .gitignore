@@ -5,6 +5,8 @@ build/
 dist/
 wheels/
 *.egg-info
+full_data_1min.pkl
+data_sample.pkl
 
 # Virtual environments
 .venv
