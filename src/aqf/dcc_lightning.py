@@ -15,7 +15,7 @@ def mae_metric(y_hat, y):
 
 
 def rmse_metric(y_hat, y):
-    return torch.mean(torch.sqrt(torch.mean((y - y_hat) ** 2, dim=0)))
+    return torch.sqrt(torch.mean((y - y_hat) ** 2))
 
 
 def smape_metric(y_hat, y):
@@ -23,11 +23,11 @@ def smape_metric(y_hat, y):
 
 
 def me_metric(y_hat, y):
-    return torch.mean(torch.max(torch.abs(y - y_hat), dim=0).values)
+    return torch.max(torch.abs(y - y_hat))
 
 
 def medae_metric(y_hat, y):
-    return torch.mean(torch.median(torch.abs(y - y_hat), dim=0).values)
+    return torch.median(torch.abs(y - y_hat))
 
 
 class CausalConv1d(nn.Module):
@@ -51,24 +51,13 @@ class CausalConv1d(nn.Module):
 
 
 class TimeAttention(nn.Module):
-    """Additive (Bahdanau-style) attention over the time dimension for one layer.
-
-    Input: tensor of shape (B, C, T)
-    - applies a small MLP on the channel dimension at each time step and
-      produces attention scores over T, then weighted-sums to (B, C).
-    Output: (context (B, C), attn_weights (B, T))
-    """
-
     def __init__(self, channels, hidden_size):
         super().__init__()
         self.W = nn.Linear(channels, hidden_size)
         self.v = nn.Linear(hidden_size, 1, bias=False)
 
     def forward(self, x):
-        # x: (B, C, T) -> work on (B, T, C)
-        # b, c, t = x.shape
         H = x.permute(0, 2, 1)  # (B, T, C)
-        # score each time step
         scores = self.v(torch.tanh(self.W(H)))  # (B, T, 1)
         scores = scores.squeeze(-1)  # (B, T)
         attn = torch.softmax(scores, dim=1)  # (B, T)
@@ -93,25 +82,17 @@ class TimeGate(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    """Residual block without gated filter/gate. Uses a single dilated causal conv
-    that expands to `dilation_channels`, then produces a residual (1x1 -> residual_channels)
-    and a skip (1x1 -> skip_channels). Additionally, we apply a TimeAttention
-    module per block on the skip features across time to get a per-layer context.
-    """
-
-    def __init__(self, residual_channels, dilation_channels, skip_channels, kernel_size, dilation, hidden_attn=32, dropout=0.0):
+    def __init__(self, residual_channels, dilation_channels, skip_channels, kernel_size, dilation, 
+                 hidden_attn=32, dropout=0.0):
         super().__init__()
-        # single dilated conv (no gating)
         self.dilated_conv = CausalConv1d(residual_channels, dilation_channels, kernel_size, dilation)
         self.activation = nn.ReLU()
 
-        # projections
         self.residual_conv = nn.Conv1d(dilation_channels, residual_channels, kernel_size=1)
         self.skip_conv = nn.Conv1d(dilation_channels, skip_channels, kernel_size=1)
 
-        # attention over time for this layer, applied to skip features
         self.time_attn = TimeGate(residual_channels, hidden_attn)
-        self.dropout = nn.Dropout(dropout)
+        # self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         # x: (B, residual_channels, T)
@@ -120,24 +101,15 @@ class ResidualBlock(nn.Module):
         z = self.activation(z)
         # z = self.dropout(z)
 
-        # residual path (per-time)
         residual = self.residual_conv(z)  # (B, residual_channels, T)
 
-        # skip features (per-time)
         skip_time = self.skip_conv(z)  # (B, skip_channels, T)
-        # Apply ReLU nonlinearity to skip features (sigma_ReLU)
         x = x + residual
 
         return x, skip_time
     
 
 class DilatedCausalCNN(pl.LightningModule):
-    """Dilated causal CNN with per-layer temporal attention implementing
-    the form: sigma^2_{T+1} = alpha0 + sum_l sigma_ReLU(F^{(l)}),
-    where each F^{(l)} is first time-attended (within layer) and then
-    summed across layers. The per-layer 1x1 skip projections provide
-    learnable scaling before summation.
-    """
     def __init__(
         self,
         in_channels,
@@ -173,8 +145,6 @@ class DilatedCausalCNN(pl.LightningModule):
                     )
                 )
 
-        # final projection from aggregated layer contexts to output
-        # end-processing modules for Option A
         self.post1 = nn.Sequential(nn.Conv1d(skip_channels, end_channels, kernel_size=1), nn.ReLU())
         self.post2 = nn.Sequential(nn.Conv1d(end_channels, out_channels, kernel_size=1), nn.ReLU())
         self.final_time_attn = TimeAttention(out_channels, hidden_attn)
@@ -192,9 +162,6 @@ class DilatedCausalCNN(pl.LightningModule):
                     x, skip_time_relu = block(x)
                     layer_skips.append(skip_time_relu)
 
-
-        # Option A: sum skip_time across layers (B, C, T)
-        # skip_sum = torch.stack(layer_skips, dim=0).sum(dim=0)
         skip_sum = torch.stack(layer_skips, dim=0).sum(dim=0)  # (B, skip_channels, T)
         skip_sum = F.relu(skip_sum)
         post = self.post1(skip_sum)
@@ -250,21 +217,9 @@ class DilatedCausalCNN(pl.LightningModule):
         # Collect outputs in an instance attribute for use in the on_test_epoch_end hook.
         if not hasattr(self, "_collected_test_outputs"):
             self._collected_test_outputs = []
-        # detach and move to cpu later when aggregating
         self._collected_test_outputs.append({"y_hat": y_hat.detach(), "y": y.detach()})
-    
-    # def test_epoch_end(self, outputs):
-    #     y_hat = torch.cat([o["y_hat"] for o in outputs], dim=0)
-    #     y     = torch.cat([o["y"]     for o in outputs], dim=0)
-
-    #     # store for external usage
-    #     self.test_preds = y_hat.cpu()
-    #     self.test_targets = y.cpu()
 
     def on_test_epoch_end(self) -> None:
-        """PL v2 hook replacement for the removed `test_epoch_end`.
-        Aggregate outputs previously saved in `self._collected_test_outputs`.
-        """
         outputs = getattr(self, "_collected_test_outputs", None)
         if not outputs:
             return
@@ -282,22 +237,21 @@ class DilatedCausalCNN(pl.LightningModule):
     
 
 class StockVolDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, num_days: int = 1, mode="univariate", return_timestamps=False, return_tickers=False):
-        """
-        Args:
-            df: pandas DataFrame with DateTimeIndex (intraday frequency), columns=tickers, values=prices
-            num_days: length of observation window in days
-        """
+    def __init__(self, df: pd.DataFrame, X_freq:int, y_freq:int = 5, num_days: int = 1, mode="univariate", 
+                 return_timestamps=False, return_tickers=False):
         assert isinstance(df.index, pd.DatetimeIndex)
         assert mode in ["multivariate", "univariate"], "mode must be 'multivariate' or 'univariate'"
         self.num_days = num_days
         self.mode = mode
+        df_X = df[df.index.minute % X_freq == 0]
+        df_y = df[df.index.minute % y_freq == 0]
 
-        # compute log-returns (keep as DataFrame for convenience)
-        self.logret_df = np.log(df / df.shift(1))
+        # compute log-returns
+        self.logret_df_X = np.log(df_X / df_X.shift(1))
+        self.logret_df_y = np.log(df_y / df_y.shift(1))
 
         # group by unique calendar days
-        self.days = sorted(set(self.logret_df.index.normalize()))
+        self.days = sorted(set(self.logret_df_X.index.normalize()))
         self.samples = []  # list of (X_numpy, y_numpy)
         # store per-sample metadata helpful for normalization
         self.timestamps = [] if return_timestamps else None
@@ -307,15 +261,9 @@ class StockVolDataset(Dataset):
             # input window: last num_days of log-returns (inclusive of start_day, exclusive of end_day)
             start_day = self.days[i - num_days]
             end_day = self.days[i]
-            # select half-open interval [start_day, end_day) to avoid leakage
-            X_df = self.logret_df.loc[start_day:end_day].iloc[1:]
-
-
-            # next-day realized variance: intraday returns for day `end_day`
-            # intraday_next = self.logret_df[(self.logret_df.index >= end_day) & (self.logret_df.index < end_day + pd.Timedelta(days=1))]
-            intraday_next = self.logret_df.loc[end_day:end_day + pd.Timedelta(days=0.5)]
-            # compute daily realized variance (sum of squared returns) — keep as numpy
-            y = 1e4 * (intraday_next ** 2).sum(axis=0).values  # shape (num_assets,)
+            X_df = self.logret_df_X.loc[start_day:end_day].iloc[1:]
+            intraday_next = self.logret_df_y.loc[end_day:end_day + pd.Timedelta(days=0.5)]
+            y = 1e4 * (intraday_next ** 2).sum(axis=0).values
 
             X = X_df.values  # shape (T_window, num_assets)
 
@@ -329,7 +277,7 @@ class StockVolDataset(Dataset):
                 for c in range(n_assets):
                     self.samples.append((X[:, c:c+1], y[c:c+1]))
                     if return_timestamps:
-                        self.timestamps.append(start_day)
+                        self.timestamps.append(end_day)
                     if return_tickers:
                         self.tickers.append(df.columns[c])
 
@@ -338,7 +286,6 @@ class StockVolDataset(Dataset):
         self._X_std = None
 
     def set_normalization(self, mean: np.ndarray, std: np.ndarray):
-        """Provide per-asset mean/std (numpy arrays) computed on training data only."""
         self._X_mean = np.asarray(mean, dtype=np.float32)
         self._X_std = np.asarray(std, dtype=np.float32)
         # avoid zero division
@@ -364,9 +311,13 @@ class StockVolDataset(Dataset):
 
 
 class StockVolDataModule(pl.LightningDataModule):
-    def __init__(self, df: pd.DataFrame, val_start_date, test_start_date, num_days: int = 1, mode = "univariate", ticker_split = False, batch_size: int = 32, num_workers: int = 0):
+    def __init__(self, df: pd.DataFrame, X_freq: int, val_start_date, test_start_date, y_freq:int = 5, 
+                 num_days: int = 1, mode = "univariate", ticker_split = False, batch_size: int = 32, 
+                 num_workers: int = 0):
         super().__init__()
         self.df = df
+        self.X_freq = X_freq
+        self.y_freq = y_freq
         self.val_start_date = val_start_date
         self.test_start_date = test_start_date
         self.num_days = num_days
@@ -376,8 +327,9 @@ class StockVolDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
 
     def setup(self, stage=None):
-        # build full dataset with metadata enabled so we can compute train statistics
-        self.full_dataset = StockVolDataset(self.df, num_days=self.num_days, mode=self.mode, return_timestamps=True, return_tickers=(self.mode == "univariate"))
+        self.full_dataset = StockVolDataset(self.df, X_freq=self.X_freq, y_freq=self.y_freq, 
+                                            num_days=self.num_days, mode=self.mode, return_timestamps=True, 
+                                            return_tickers=(self.mode == "univariate"))
 
         timestamps = pd.to_datetime(self.full_dataset.timestamps)
 
@@ -407,10 +359,6 @@ class StockVolDataModule(pl.LightningDataModule):
         val_idx = np.where(val_mask)[0]
         test_idx = np.where(test_mask)[0]
 
-        # --- compute normalization stats from training samples only ---
-        num_assets = self.df.shape[1]
-
-
         # concatenate X matrices from training samples along time axis
         X_list = [self.full_dataset.samples[i][0] for i in train_idx]
         if len(X_list) == 0:
@@ -419,26 +367,28 @@ class StockVolDataModule(pl.LightningDataModule):
         mean = X_cat.mean(axis=0)
         std = X_cat.std(axis=0)
 
-        # set normalization on the underlying full dataset (Subsets will inherit it)
         self.full_dataset.set_normalization(mean, std)
 
-        # create subsets
         self.train_dataset = Subset(self.full_dataset, train_idx)
         self.val_dataset = Subset(self.full_dataset, val_idx)
         self.test_dataset = Subset(self.full_dataset, test_idx)
         
         self.test_tickers = np.array(self.full_dataset.tickers)[test_idx] if self.mode == "univariate" else None
+        self.test_dates = pd.Index(self.full_dataset.timestamps)[test_idx].unique()
 
         print(f"Dataset split: train={len(self.train_dataset)}, val={len(self.val_dataset)}, test={len(self.test_dataset)}")
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, 
+                          num_workers=self.num_workers)
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, 
+                          num_workers=self.num_workers)
 
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+        return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, 
+                          num_workers=self.num_workers)
 
 class LossHistory(pl.Callback):
     def __init__(self):

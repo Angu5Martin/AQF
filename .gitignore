@@ -6,8 +6,10 @@ dist/
 wheels/
 *.egg-info
 full_data_1min.pkl
+full_data_1min_corrected.pkl
 data_sample.pkl
 
 # Virtual environments
 .venv
 lightning_logs/
+checkpoints/

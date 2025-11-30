@@ -5,12 +5,12 @@ import pytorch_lightning as pl
 import warnings
 import numpy as np
 import torch
+import os
 
 
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 
-# Import our custom data access client
-# Restart imports to pick up new methods
+
 import importlib
 import src.aqf.data_access
 import src.aqf.tickers
@@ -35,11 +35,7 @@ plt.rcParams['figure.figsize'] = (12, 8)
 import plotly.io as pio
 pio.renderers.default = 'notebook'
 
-def scatter_pred_vs_real(y_true, y_pred, data_type, tickers=None):
-    """
-    y_true, y_pred: shape (N, A)
-    tickers: optional list of ticker names of length A
-    """
+def scatter_pred_vs_real(y_true, y_pred, data_type, dates, tickers, save_path):
     y_true = np.asarray(y_true)
     y_pred = np.asarray(y_pred)
 
@@ -51,7 +47,7 @@ def scatter_pred_vs_real(y_true, y_pred, data_type, tickers=None):
     if data_type == 'multivariate':
         colors = plt.cm.tab20(np.linspace(0, 1, A))
         for i in range(A):
-            plt.scatter(y_true[:, i], y_pred[:, i], color=colors[i], label=tickers[i], alpha=0.7)
+            plt.scatter(y_true[:, i], y_pred[:, i], color=colors[i], alpha=0.7)
         
     else:
         tickers_unique = list(set(tickers))
@@ -61,21 +57,45 @@ def scatter_pred_vs_real(y_true, y_pred, data_type, tickers=None):
 
         plt.scatter(y_true[:, 0], y_pred[:, 0], color=color_pt_list, alpha=0.7)
 
-
-    # reference line
     mn = min(y_true.min(), y_pred.min())
     mx = max(y_true.max(), y_pred.max())
     plt.plot([mn, mx], [mn, mx], "k--", lw=2)
 
-    plt.xlabel("Realized Volatility")
-    plt.ylabel("Predicted Volatility")
+    plt.xlabel("Realized Variance")
+    plt.ylabel("Predicted Variance")
     plt.legend(ncol=2, fontsize=7)
-    plt.title("Predicted vs Realized Volatility")
+    plt.title("Predicted vs Realized Variance")
     plt.grid(True)
     plt.tight_layout()
     plt.yscale('log')
     plt.xscale('log')
+    plt.savefig(f'{save_path}/pred_vs_real_scatter.png')
     plt.show()
+    os.makedirs(f'{save_path}/var_paths', exist_ok=True)
+
+    if data_type == 'multivariate':
+        for i in range(A):
+            plt.plot(dates, y_true[:, i], label=f'Realized Variance - {tickers[i]}', color='blue')
+            plt.plot(dates, y_pred[:, i], label=f'Predicted Variance - {tickers[i]}', color='red')
+            plt.legend(ncol=2, fontsize=7)
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(f'{save_path}/var_paths/{tickers[i]}.png')
+            plt.cla()
+        
+    else:
+        tickers_unique = list(set(tickers))
+        for ticker in tickers_unique:
+            idxs = [i for i, t in enumerate(tickers) if t == ticker]
+            plt.plot(dates, y_true[idxs, 0], label=f'Realized Variance - {ticker}', color='blue')
+            plt.plot(dates, y_pred[idxs, 0], label=f'Predicted Variance - {ticker}', color='red')
+            plt.legend(ncol=2, fontsize=7)
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(f'{save_path}/var_paths/{ticker}.png')
+            plt.cla()
+
+    
 
 if __name__ == "__main__":
     print("CUDA available:", torch.cuda.is_available())
@@ -83,37 +103,41 @@ if __name__ == "__main__":
         print("GPU device:", torch.cuda.get_device_name(0))
         print("GPU memory:", torch.cuda.get_device_properties(0).total_memory / 1e9, "GB")
 
-    df = pd.read_pickle('full_data_1min.pkl')
-    num_days = 1
-    freq = 5
+    df = pd.read_pickle('full_data_1min_corrected.pkl')
+    num_days = 10
+    X_freq = 30
+    y_freq = 5
     mode = "univariate"
-    ticker_split = False
+    ticker_split = True
     batch_size = 512
     # val_start_date = '2020-10-01'
     # test_start_date = '2021-01-01'
-    val_start_date = '2020-10-01'
-    test_start_date = '2021-01-01'
+    val_start_date = '2021-01-01'
+    test_start_date = '2021-02-01'
     residual_channels=32
     skip_channels=64
+    dilation_channels=128
     end_channels=32
     kernel_size=3
     num_blocks=2
     num_layers=6
     dropout=0.0
+    clip_val=1.0
     lr= 1e-3
     patience=50
     max_epochs=1000
-    run_name = f'{freq}min_{num_days}day_{mode}'
+    run_name = f'split_FF_{X_freq}-{y_freq}_min_{num_days}day_{mode}'
     
-    df = df[df.index.minute % freq == 0]
-    datamodule = StockVolDataModule(df=df, val_start_date=val_start_date, test_start_date=test_start_date,
+    print(df.index)
+    datamodule = StockVolDataModule(df=df, X_freq=X_freq, y_freq=y_freq, val_start_date=val_start_date, test_start_date=test_start_date,
                                  num_days=num_days, mode=mode, ticker_split=ticker_split, batch_size=batch_size)
     
     num_stocks = df.shape[1]
     model = DilatedCausalCNN(
     in_channels=(num_stocks if mode=="multivariate" else 1),   # features = number of stocks
-    out_channels=(num_stocks if mode=="multivariate" else 1),  # predict volatility for each stock
+    out_channels=(num_stocks if mode=="multivariate" else 1),
     residual_channels=residual_channels,
+    dilation_channels=dilation_channels,
     skip_channels=skip_channels,
     end_channels=end_channels,
     kernel_size=kernel_size,
@@ -141,7 +165,9 @@ if __name__ == "__main__":
         max_epochs=max_epochs,
         callbacks=[early_stop, history, checkpoint_cb],
         accelerator="gpu",
+        gradient_clip_val=clip_val,
     )
+    
 
     print(trainer.accelerator)
 
@@ -156,6 +182,7 @@ if __name__ == "__main__":
     plt.title("Training & Validation Loss")
     plt.legend()
     plt.grid(True)
+    plt.savefig(f'checkpoints/{run_name}/loss_curve.png')
     plt.show()
 
     model = DilatedCausalCNN.load_from_checkpoint(trainer.checkpoint_callback.best_model_path)
@@ -163,7 +190,9 @@ if __name__ == "__main__":
     y_pred = model.test_preds
     y_true = model.test_targets
     tickers = df.columns.tolist() if mode=="multivariate" else datamodule.test_tickers.tolist()
-    scatter_pred_vs_real(y_true, y_pred, data_type=mode, tickers=tickers)
+    dates = datamodule.test_dates
+    scatter_pred_vs_real(y_true, y_pred, data_type=mode, dates=dates, tickers=tickers, 
+                         save_path=f'checkpoints/{run_name}')
     
 
 
